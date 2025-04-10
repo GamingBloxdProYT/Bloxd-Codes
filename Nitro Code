@@ -1,0 +1,25 @@
+World Code
+
+tick=()=>{
+for (const playerId of api.getPlayerIds()) {
+
+if (JSON.stringify(api.getHeldItem(playerId)).includes("Nitro")) {
+api.applyEffect(playerId,"Speed", 500,{inbuiltLevel:30})
+}
+}
+}
+
+
+Item Code
+
+api.giveItem(myId, "Diamond Hoe", 1, { 
+customDisplayName:"Nitro", 
+customDescription:"BOOST YOUR SPEED!"})
+
+
+
+
+
+
+
+
