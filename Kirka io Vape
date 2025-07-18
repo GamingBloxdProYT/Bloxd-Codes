@@ -29,9 +29,9 @@ document.addEventListener("keydown", (event) => {
     }
 });
 
-let customUsername = localStorage.getItem('kirka_custom_username') || "Mr_Hacker";
+let customUsername = localStorage.getItem('kirka_custom_username') || "Click to change Name";
 let clanTag = localStorage.getItem('kirka_clan_tag') || "☠HACKER☠";
-let level = localStorage.getItem('kirka_level') || "∞";
+let level = localStorage.getItem('kirka_level') || "23412";
 let isVerified = localStorage.getItem('kirka_verified') === 'true' || true;
 
 // Style for input fields
