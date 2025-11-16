@@ -1,0 +1,630 @@
+// ==UserScript==
+// @name         Recorder for Bloxd.io
+// @namespace    https://bloxd.io/
+// @version      1.4
+// @description  Record, edit, draw, trim, and manage gallery for Bloxd.io gameplay with webcam and screenshots (v1.4)
+// @author       SigmaGamerzYT (https://youtube.com/@gamingbloxdpro)
+// @match        https://apkpure.bloxd.io
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+    // CHANGE https://apkpure.bloxd.io WITH ANY URL YOU WANT SO YOU CAN USE IT EVERYWHERE! For Example: https://youtube.com
+    // Recorder for Bloxd.io v1.4
+    // - Builds on v1.3 and adds an animated draggable clickable open button that saves position
+    // - Builds a single self-contained userscript implementing GUI, recording, screenshots, editors, gallery, webcam, draw tools and more.
+    // NOTE: This script runs entirely in-browser and uses IndexedDB/localStorage for persistence.
+
+    /* --------------------------- Config / Keys --------------------------- */
+    const VERSION = '1.4';
+    const DB_NAME = 'bxdRecorderDB_v1_4';
+    const DB_STORE = 'files';
+    const META_KEY = 'bxd_gallery_meta_v1_4';
+    const THEME_KEY = 'bxd_theme_v1_4';
+    const POS_KEY = 'bxd_gui_pos_v1_4';
+    const BTN_POS_X = 'bxd_btn_x_v1_4';
+    const BTN_POS_Y = 'bxd_btn_y_v1_4';
+    const POPUP_POS_KEY = 'bxd_popup_pos_v1_4';
+    const VIDEO_LIMIT = 100;
+    const SCREEN_LIMIT = 500;
+
+    /* --------------------------- Small helpers --------------------------- */
+    const setLS = (k,v) => localStorage.setItem(k, JSON.stringify(v));
+    const getLS = (k,d=null) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch(e) { return d; } };
+    const uid = p => (p||'id')+'_'+Math.random().toString(36).slice(2,9);
+    function $(sel, ctx=document){ return ctx.querySelector(sel); }
+    function qAll(sel, ctx=document){ return Array.from((ctx||document).querySelectorAll(sel)); }
+    function escapeHtml(s){ return (s||'').toString().replace(/[&<>\"]/g, c=> ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+    /* --------------------------- DB helpers --------------------------- */
+    function openDB(){ return new Promise((res,rej)=>{ const r = indexedDB.open(DB_NAME,1); r.onupgradeneeded = e => { const db=e.target.result; if(!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE, { keyPath:'id' }); }; r.onsuccess = e => res(e.target.result); r.onerror = e => rej(e.target.error); }); }
+    async function idbPut(id, blob, meta){ const db = await openDB(); return new Promise((res,rej)=>{ const tx = db.transaction(DB_STORE, 'readwrite'); tx.objectStore(DB_STORE).put({id, blob, meta}); tx.oncomplete = ()=> res(true); tx.onerror = e => rej(e.target.error); }); }
+    async function idbGet(id){ const db = await openDB(); return new Promise((res,rej)=>{ const tx = db.transaction(DB_STORE, 'readonly'); const rq = tx.objectStore(DB_STORE).get(id); rq.onsuccess = ()=> res(rq.result||null); rq.onerror = e => rej(e.target.error); }); }
+    async function idbDelete(id){ const db = await openDB(); return new Promise((res,rej)=>{ const tx = db.transaction(DB_STORE,'readwrite'); tx.objectStore(DB_STORE).delete(id); tx.oncomplete = ()=> res(true); tx.onerror = e => rej(e.target.error); }); }
+
+    /* --------------------------- State --------------------------- */
+    const state = {
+        gallery: getLS(META_KEY, { videos: [], screenshots: [] }),
+        theme: getLS(THEME_KEY, 'white'),
+        guiPos: getLS(POS_KEY, null),
+        popupPos: getLS(POPUP_POS_KEY, null),
+        liveStream: null,
+        webcamStream: null,
+        combinedStream: null,
+        recorder: null,
+        recording: false,
+        currentChunks: [],
+        sessionSegments: [],
+        lastScreenshot: null
+    };
+    state.gallery.videos = state.gallery.videos || [];
+    state.gallery.screenshots = state.gallery.screenshots || [];
+
+    /* --------------------------- Styles --------------------------- */
+    const css = `
+    /* core */
+    .bxd-rec-toggle{position:fixed;z-index:999999;padding:10px 16px;border-radius:12px;cursor:pointer;font-weight:700;user-select:none}
+    .bxd-rec-panel{position:fixed;z-index:999998;min-width:360px;max-width:760px;border-radius:12px;padding:12px;backdrop-filter:blur(6px);box-shadow:0 10px 40px rgba(2,6,23,0.6)}
+    .bxd-rec-row{display:flex;gap:8px;flex-wrap:wrap}
+    .bxd-rec-btn{border:none;padding:8px 10px;border-radius:8px;cursor:pointer;font-weight:700}
+    .bxd-rec-cat{display:flex;gap:8px;align-items:center;padding:8px;cursor:pointer;border-radius:8px}
+    .bxd-rec-cat:hover{opacity:0.95}
+    .bxd-cat-panel{margin-top:8px;border-radius:8px;padding:8px}
+    .bxd-modal-overlay{position:fixed;left:0;top:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;z-index:1000000;backdrop-filter:blur(6px);background:rgba(0,0,0,0.45);opacity:0;transition:opacity 250ms ease}
+    .bxd-modal{background:var(--panel-trans);padding:12px;border-radius:10px;min-width:320px;max-width:920px;box-shadow:0 8px 30px rgba(0,0,0,0.35);transform:scale(0.96);transition:transform 250ms ease,opacity 250ms ease}
+    .bxd-show{opacity:1;transform:scale(1)}
+    .bxd-gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
+    .bxd-thumb{background:rgba(255,255,255,0.03);padding:8px;border-radius:8px;display:flex;flex-direction:column;align-items:center;gap:6px}
+    .bxd-webcam{position:fixed;z-index:1000001;width:180px;height:120px;border-radius:10px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,0.5);cursor:move}
+    .bxd-toast{position:fixed;left:50%;transform:translateX(-50%);bottom:20px;z-index:1000010;padding:8px 12px;border-radius:8px;backdrop-filter:blur(4px);box-shadow:0 6px 18px rgba(0,0,0,0.3)}
+    .bxd-rec-input{padding:6px;border-radius:6px;border:1px solid rgba(0,0,0,0.08)}
+    `;
+    const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
+
+    /* --------------------------- Theme --------------------------- */
+    function applyTheme(t){ state.theme = t; setLS(THEME_KEY, t); const root = document.documentElement; if(t==='dark'){ root.style.setProperty('--panel-bg','#071017'); root.style.setProperty('--btn-bg','#60a5fa'); root.style.setProperty('--btn-text','#ffffff'); root.style.setProperty('--panel-text','#fff'); root.style.setProperty('--panel-trans','rgba(11,16,20,0.78)'); } else { root.style.setProperty('--panel-bg','#ffffff'); root.style.setProperty('--btn-bg','#3b82f6'); root.style.setProperty('--btn-text','#000000'); root.style.setProperty('--panel-text','#000'); root.style.setProperty('--panel-trans','rgba(255,255,255,0.88)'); } qAll('.bxd-rec-panel').forEach(p=>{ p.style.background='var(--panel-trans)'; p.style.color='var(--panel-text)'; }); qAll('.bxd-rec-btn').forEach(b=>{ b.style.background='var(--btn-bg)'; b.style.color='var(--btn-text)'; }); }
+
+    /* --------------------------- DOM Builder (GUI) --------------------------- */
+    const panel = document.createElement('div');
+    panel.className = 'bxd-rec-panel';
+    panel.style.display = 'none';
+    panel.style.background = 'var(--panel-trans)';
+    panel.style.color = 'var(--panel-text)';
+    panel.innerHTML = `
+      <div style='display:flex;justify-content:space-between;align-items:center;gap:8px'>
+        <div style='font-weight:800'>Recorder for Bloxd.io — v${VERSION}</div>
+        <div style='display:flex;gap:8px;align-items:center'>
+          <div style='display:flex;gap:8px;align-items:center'>
+            <button id='theme-dark' class='bxd-rec-btn'>Dark Theme</button>
+            <button id='theme-white' class='bxd-rec-btn'>White Theme</button>
+          </div>
+          <button id='panel-close' class='bxd-rec-btn'>✖</button>
+        </div>
+      </div>
+      <div style='display:flex;gap:8px;margin-top:10px;flex-wrap:wrap'>
+        <div id='cat-status' class='bxd-rec-cat'><span>🟢</span><span style='font-weight:700'>Status</span></div>
+        <div id='cat-recorder' class='bxd-rec-cat'><span>🎥</span><span style='font-weight:700'>Recorder</span></div>
+        <div id='cat-screenshot' class='bxd-rec-cat'><span>📷</span><span style='font-weight:700'>Screenshot</span></div>
+        <div id='cat-settings' class='bxd-rec-cat'><span>⚙️</span><span style='font-weight:700'>Settings</span></div>
+        <div id='cat-gallery' class='bxd-rec-cat'><span>🖼️</span><span style='font-weight:700'>Gallery</span></div>
+      </div>
+      <div id='cat-area' style='margin-top:10px'></div>
+      <div id='status' style='margin-top:8px;font-size:13px;opacity:0.9'></div>
+    `;
+    document.body.appendChild(panel);
+
+    /* --------------------------- Open Button (draggable + clickable + save pos + animations) --------------------------- */
+    function toggleRecorderGUI(){ panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; if(panel.style.display === 'block'){ panel.style.opacity = '0'; panel.style.transform = 'translateY(8px)'; setTimeout(()=>{ panel.style.transition='all 200ms ease'; panel.style.opacity='1'; panel.style.transform='translateY(0)'; },8); } }
+    function createRecorderOpenButton(){
+        const btn = document.createElement('div');
+        btn.id = 'recorderOpenBtn';
+        btn.textContent = '🎥 Recorder';
+        btn.style.position = 'fixed';
+        btn.style.padding = '10px 18px';
+        btn.style.background = '#3b82f6';
+        btn.style.color = 'black';
+        btn.style.borderRadius = '14px';
+        btn.style.fontSize = '15px';
+        btn.style.cursor = 'pointer';
+        btn.style.zIndex = '999999999';
+        btn.style.userSelect = 'none';
+        btn.style.fontWeight = '700';
+        btn.style.boxShadow = '0 6px 18px rgba(0,0,0,0.25)';
+        btn.style.transition = 'transform 160ms ease, opacity 160ms ease';
+        btn.style.opacity = '0.95';
+
+        // restore saved position
+        const savedX = localStorage.getItem(BTN_POS_X);
+        const savedY = localStorage.getItem(BTN_POS_Y);
+        btn.style.left = savedX ? (savedX + 'px') : '20px';
+        btn.style.top  = savedY ? (savedY + 'px') : '20px';
+
+        btn.addEventListener('mouseenter', ()=>{ btn.style.transform = 'scale(1.06)'; btn.style.opacity = '1'; });
+        btn.addEventListener('mouseleave', ()=>{ btn.style.transform = 'scale(1)'; btn.style.opacity = '0.95'; });
+
+        document.body.appendChild(btn);
+
+        let isDragging = false;
+        let startX=0, startY=0, origX=0, origY=0;
+        let moved = false;
+
+        btn.addEventListener('pointerdown', (e)=>{
+            isDragging = true;
+            moved = false;
+            startX = e.clientX;
+            startY = e.clientY;
+            origX = parseInt(btn.style.left || 0);
+            origY = parseInt(btn.style.top || 0);
+            btn.setPointerCapture && btn.setPointerCapture(e.pointerId);
+        });
+
+        window.addEventListener('pointermove', (e)=>{
+            if(!isDragging) return;
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            if(Math.abs(dx) > 4 || Math.abs(dy) > 4) moved = true;
+            const nx = origX + dx;
+            const ny = origY + dy;
+            btn.style.left = nx + 'px';
+            btn.style.top = ny + 'px';
+            localStorage.setItem(BTN_POS_X, nx);
+            localStorage.setItem(BTN_POS_Y, ny);
+        });
+
+        window.addEventListener('pointerup', (e)=>{
+            if(!isDragging) return;
+            isDragging = false;
+            // click semantics: if not moved then toggle GUI
+            if(!moved) toggleRecorderGUI();
+        });
+
+        // also support keyboard accessibility (Enter toggles)
+        btn.tabIndex = 0;
+        btn.addEventListener('keydown', (e)=>{ if(e.key === 'Enter') toggleRecorderGUI(); });
+
+        return btn;
+    }
+
+    const openBtn = createRecorderOpenButton();
+
+    /* --------------------------- Draggable helpers --------------------------- */
+    function makeDraggable(el, handle){ let dragging=false, sx=0, sy=0, ox=0, oy=0; if(!handle) handle=el; handle.style.cursor='move'; handle.addEventListener('pointerdown', e=>{ dragging=true; sx=e.clientX; sy=e.clientY; const rect=el.getBoundingClientRect(); ox=rect.left; oy=rect.top; handle.setPointerCapture && handle.setPointerCapture(e.pointerId); }); window.addEventListener('pointermove', e=>{ if(!dragging) return; const dx=e.clientX-sx, dy=e.clientY-sy; el.style.left=(ox+dx)+'px'; el.style.top=(oy+dy)+'px'; el.style.right='auto'; el.style.bottom='auto'; }); window.addEventListener('pointerup', ()=>{ if(dragging){ dragging=false; setLS(POS_KEY, { left: panel.style.left, top: panel.style.top }); } }); }
+
+    /* --------------------------- Wire main panel controls --------------------------- */
+    $('#panel-close', panel).addEventListener('click', ()=> panel.style.display='none');
+    $('#theme-dark', panel).addEventListener('click', ()=> applyTheme('dark'));
+    $('#theme-white', panel).addEventListener('click', ()=> applyTheme('white'));
+    applyTheme(state.theme);
+
+    /* --------------------------- Categories logic --------------------------- */
+    const catArea = $('#cat-area', panel);
+    let currentCat = null;
+    function closeAllCats(){ catArea.innerHTML = ''; currentCat = null; }
+    function toggleCategory(id){ if(currentCat === id){ closeAllCats(); return; } currentCat = id; closeAllCats(); if(id==='status') renderStatusCat(); if(id==='recorder') renderRecorderCat(); if(id==='screenshot') renderScreenshotCat(); if(id==='settings') renderSettingsCat(); if(id==='gallery') renderGalleryCat(); }
+    $('#cat-status', panel).addEventListener('click', ()=> toggleCategory('status'));
+    $('#cat-recorder', panel).addEventListener('click', ()=> toggleCategory('recorder'));
+    $('#cat-screenshot', panel).addEventListener('click', ()=> toggleCategory('screenshot'));
+    $('#cat-settings', panel).addEventListener('click', ()=> toggleCategory('settings'));
+    $('#cat-gallery', panel).addEventListener('click', ()=> toggleCategory('gallery'));
+
+    /* --------------------------- Status Category --------------------------- */
+    function renderStatusCat(){
+        catArea.innerHTML = `<div class='bxd-cat-panel'><div style='display:flex;flex-direction:column;gap:8px'><div>🎥 Recording: <span id='st-rec'>🔴</span></div><div>📷 Screenshot Mode: <span id='st-shot'>🔴</span></div><div>🎙️ Microphone: <span id='st-mic'>🔴</span></div><div>📹 Webcam: <span id='st-webcam'>🔴</span></div><div><button id='st-refresh' class='bxd-rec-btn'>🔄 Refresh</button></div></div></div>`;
+        $('#st-refresh', catArea).addEventListener('click', updateStatusIndicators);
+        updateStatusIndicators();
+    }
+    function updateStatusIndicators(){
+        const strec = $('#st-rec', catArea); if(strec) strec.textContent = state.recording ? '🟢' : '🔴';
+        const stshot = $('#st-shot', catArea); if(stshot) stshot.textContent = state.lastScreenshot ? '🟢' : '🔴';
+        const stmic = $('#st-mic', catArea); if(stmic) stmic.textContent = (state.recorder ? '🟢' : '🔴');
+        const stweb = $('#st-webcam', catArea); if(stweb) stweb.textContent = state.webcamStream ? '🟢' : '🔴';
+    }
+
+    /* --------------------------- Recorder category & flow --------------------------- */
+    function renderRecorderCat(){
+        catArea.innerHTML = `
+        <div class='bxd-cat-panel'>
+          <div class='bxd-rec-row'>
+            <button id='btn-start' class='bxd-rec-btn'>Start Recording</button>
+            <button id='btn-stop' class='bxd-rec-btn' disabled>Stop Recording</button>
+            <button id='btn-webcam' class='bxd-rec-btn'>WebCam</button>
+            <button id='btn-mic' class='bxd-rec-btn'>Microphone ✓</button>
+            <button id='btn-editvideo' class='bxd-rec-btn' disabled>Edit Video</button>
+            <button id='btn-finishvideo' class='bxd-rec-btn' disabled>Finish Video</button>
+          </div>
+          <div style='margin-top:8px'><button id='btn-save-session' class='bxd-rec-btn'>Save Session to Gallery</button></div>
+        </div>`;
+        $('#btn-start', catArea).addEventListener('click', startRecordingFlow);
+        $('#btn-stop', catArea).addEventListener('click', stopRecordingFlow);
+        $('#btn-webcam', catArea).addEventListener('click', toggleWebcam);
+        $('#btn-mic', catArea).addEventListener('click', toggleMic);
+        $('#btn-editvideo', catArea).addEventListener('click', ()=>{ if(state.sessionSegments.length===0) return setStatus('No session segments'); const s = state.sessionSegments[state.sessionSegments.length-1]; openVideoEditorWithBlob(s.blob, s.meta); });
+        $('#btn-finishvideo', catArea).addEventListener('click', finishSessionToEdited);
+        $('#btn-save-session', catArea).addEventListener('click', saveSessionToGallery);
+        updateCatButtons();
+    }
+
+    async function startRecordingFlow(){
+        try{
+            const display = await navigator.mediaDevices.getDisplayMedia({video:true, audio:true});
+            state.liveStream = display;
+            if(state.webcamStream){
+                const combined = new MediaStream();
+                display.getVideoTracks().forEach(t=>combined.addTrack(t));
+                display.getAudioTracks().forEach(t=>combined.addTrack(t));
+                state.webcamStream.getVideoTracks().forEach(t=>combined.addTrack(t));
+                state.combinedStream = combined;
+            } else state.combinedStream = display;
+
+            state.currentChunks = [];
+            try{ state.recorder = new MediaRecorder(state.combinedStream, { mimeType: 'video/webm;codecs=vp9' }); }catch(e){ state.recorder = new MediaRecorder(state.combinedStream); }
+            state.recorder.ondataavailable = e=>{ if(e.data && e.data.size) state.currentChunks.push(e.data); };
+            state.recorder.start(1000);
+            state.recording = true;
+            setStatus('Recording...');
+            updateStatusIndicators();
+            updateCatButtons();
+        }catch(e){
+            setStatus('Share screen denied');
+        }
+    }
+
+    async function stopRecordingFlow(){
+        if(!(state.recorder && state.recording)) return;
+        state.recorder.onstop = async ()=>{
+            const blob = new Blob(state.currentChunks, { type:'video/webm' });
+            const meta = { id: uid('vid'), name: `Recording_${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, created: Date.now(), duration: await getBlobDuration(blob) };
+            state.sessionSegments.push({ id: meta.id, blob, meta });
+            state.currentChunks = [];
+            state.recording = false;
+            setStatus('Recording stopped — open editor');
+            updateStatusIndicators();
+            updateCatButtons();
+            openRecordingPopup(meta.id);
+        };
+        try{ state.recorder.stop(); if(state.liveStream) state.liveStream.getTracks().forEach(t=>t.stop()); state.liveStream = null; }catch(e){}
+    }
+
+    /* --------------------------- Recording popup inside GUI --------------------------- */
+    async function openRecordingPopup(segId){
+        const seg = state.sessionSegments.find(s=>s.id===segId); if(!seg) return setStatus('Segment not found');
+        const url = URL.createObjectURL(seg.blob);
+        const overlay = document.createElement('div'); overlay.className = 'bxd-modal-overlay'; overlay.style.zIndex = 999999; overlay.style.position='absolute'; // inside panel
+        const modal = document.createElement('div'); modal.className='bxd-modal'; modal.style.background='var(--panel-trans)';
+        modal.innerHTML = `<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px'><div style='font-weight:800'>🎥 Recording Editor</div><div style='display:flex;gap:8px'><input id='rec-name' class='bxd-rec-input' style='padding:6px' value='${escapeHtml(seg.meta.name)}' /><button id='close-rec' class='bxd-rec-btn'>✖</button></div></div><div style='display:flex;gap:12px;align-items:flex-start'><video id='rec-preview' src='${url}' controls style='width:420px;max-height:260px;border-radius:8px'></video><div style='display:flex;flex-direction:column;gap:8px'><button id='play-preview' class='bxd-rec-btn'>Play Preview</button><button id='trim-rec' class='bxd-rec-btn'>Trim</button><button id='draw-rec' class='bxd-rec-btn'>✏️ Draw/Text</button><button id='sound-rec' class='bxd-rec-btn'>Add Sound</button><button id='save-rec' class='bxd-rec-btn'>💾 Save to Gallery</button><button id='delete-rec' class='bxd-rec-btn'>❌ Delete</button></div></div>`;
+        overlay.appendChild(modal);
+        // append overlay inside panel so popup is within GUI area
+        panel.appendChild(overlay);
+        setTimeout(()=> overlay.classList.add('bxd-show'), 20);
+        makeDraggable(modal, modal);
+
+        $('#close-rec', overlay).addEventListener('click', ()=>{ URL.revokeObjectURL(url); closeRecordingPopup(overlay); });
+        $('#play-preview', overlay).addEventListener('click', ()=>{ const v = overlay.querySelector('#rec-preview'); v.currentTime=0; v.play(); });
+        $('#trim-rec', overlay).addEventListener('click', ()=>{ openTrimEditorForSegment(seg); });
+        $('#draw-rec', overlay).addEventListener('click', ()=>{ openDrawEditorForSegment(seg); });
+        $('#sound-rec', overlay).addEventListener('click', ()=>{ openSoundAdder(seg); });
+        $('#delete-rec', overlay).addEventListener('click', ()=>{ if(!confirm('Delete this recording?')) return; state.sessionSegments = state.sessionSegments.filter(s=>s.id!==segId); setStatus('Segment deleted'); closeRecordingPopup(overlay); updateCatButtons(); });
+        $('#save-rec', overlay).addEventListener('click', async ()=>{ if(state.gallery.videos.length >= VIDEO_LIMIT){ showWarning('⚠️ Gallery limit reached. Delete any video.'); return; } const newName = overlay.querySelector('#rec-name').value || seg.meta.name; seg.meta.name = newName; await idbPut(seg.id, seg.blob, seg.meta); state.gallery.videos.unshift({ id: seg.id, name: newName, created: seg.meta.created }); setLS(META_KEY, state.gallery); showToast('✅ Saved to Gallery'); closeRecordingPopup(overlay); renderGalleryView('videos'); updateCatButtons(); });
+    }
+    function closeRecordingPopup(ov){ ov.classList.remove('bxd-show'); setTimeout(()=>{ ov.remove(); },260); }
+
+    /* --------------------------- Editors (trim/draw placeholders) --------------------------- */
+    function openTrimEditorForSegment(seg){ openVideoEditorWithBlob(seg.blob, seg.meta); }
+    function openDrawEditorForSegment(seg){ openVideoEditorWithBlob(seg.blob, seg.meta); }
+    function openSoundAdder(seg){ const input = document.createElement('input'); input.type='file'; input.accept='audio/*'; input.addEventListener('change', ()=> showToast('🔊 Sound added (mixing in-browser is limited)')); input.click(); }
+
+    /* --------------------------- Screenshot category & finish popup --------------------------- */
+    function renderScreenshotCat(){
+        catArea.innerHTML = `
+        <div class='bxd-cat-panel'>
+          <div class='bxd-rec-row'>
+            <button id='btn-snap' class='bxd-rec-btn'>Screenshot</button>
+            <button id='btn-editsnap' class='bxd-rec-btn' disabled>Edit Screenshot</button>
+            <button id='btn-finishsnap' class='bxd-rec-btn' disabled>Finish Screenshot</button>
+            <button id='btn-downloadsnap' class='bxd-rec-btn' disabled>Download Screenshot</button>
+          </div>
+        </div>`;
+        $('#btn-snap', catArea).addEventListener('click', takeScreenshot);
+        $('#btn-editsnap', catArea).addEventListener('click', openEditScreenshot);
+        $('#btn-finishsnap', catArea).addEventListener('click', finishScreenshot);
+        $('#btn-downloadsnap', catArea).addEventListener('click', ()=>{ if(!state.lastScreenshot) return setStatus('No screenshot'); const url = URL.createObjectURL(state.lastScreenshot.blob); const a = document.createElement('a'); a.href = url; a.download = state.lastScreenshot.name; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); setStatus('Downloaded screenshot'); });
+        updateCatButtons();
+    }
+
+    async function takeScreenshot(){
+        try{
+            const s = await navigator.mediaDevices.getDisplayMedia({video:true});
+            const v = document.createElement('video'); v.style.display = 'none'; v.srcObject = s; v.play().catch(()=>{});
+            await new Promise(r=> setTimeout(r, 300));
+            const w = v.videoWidth || 1280, h = v.videoHeight || 720;
+            const c = document.createElement('canvas'); c.width = w; c.height = h; const ctx = c.getContext('2d'); ctx.drawImage(v,0,0,w,h);
+            const blob = await new Promise(res=> c.toBlob(res, 'image/png'));
+            s.getTracks().forEach(t=>t.stop());
+            state.lastScreenshot = { id: uid('shot'), blob, name: `Screenshot_${new Date().toISOString().replace(/[:.]/g,'-')}.png`, created: Date.now() };
+            setStatus('Screenshot captured');
+            updateStatusIndicators(); updateCatButtons();
+            const editBtn = $('#btn-editsnap', panel); if(editBtn) editBtn.disabled = false;
+            const finishBtn = $('#btn-finishsnap', panel); if(finishBtn) finishBtn.disabled = false;
+            const dlBtn = $('#btn-downloadsnap', panel); if(dlBtn) dlBtn.disabled = false;
+        }catch(e){
+            setStatus('Screenshot failed or denied');
+        }
+    }
+
+    function finishScreenshot(){
+        openScreenshotFinishPopup();
+    }
+
+    function openScreenshotFinishPopup(){
+        if(!state.lastScreenshot) return setStatus('No screenshot');
+        const url = URL.createObjectURL(state.lastScreenshot.blob);
+        const overlay = document.createElement('div'); overlay.className='bxd-modal-overlay';
+        const modal = document.createElement('div'); modal.className='bxd-modal'; modal.style.background='var(--panel-trans)';
+        modal.innerHTML = `<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px'><div style='font-weight:800'>📷 Screenshot Editor</div><div style='display:flex;gap:8px'><input id='ss-name' class='bxd-rec-input' style='padding:6px' value='${escapeHtml(state.lastScreenshot.name)}' /><button id='close-ss' class='bxd-rec-btn'>✖</button></div></div><div style='display:flex;gap:12px;align-items:flex-start'><img id='ss-preview' src='${url}' style='max-width:420px;border-radius:8px'><div style='display:flex;flex-direction:column;gap:8px'><button id='draw-ss' class='bxd-rec-btn'>✏️ Draw/Text</button><button id='save-ss' class='bxd-rec-btn'>💾 Save to Gallery</button><button id='delete-ss' class='bxd-rec-btn'>❌ Delete</button></div></div>`;
+        overlay.appendChild(modal); panel.appendChild(overlay); setTimeout(()=> overlay.classList.add('bxd-show'), 20);
+        makeDraggable(modal, modal);
+        $('#close-ss', overlay).addEventListener('click', ()=>{ URL.revokeObjectURL(url); closeRecordingPopup(overlay); });
+        $('#draw-ss', overlay).addEventListener('click', ()=>{ const reader = new FileReader(); reader.onload = ()=> openScreenshotEditor(reader.result); reader.readAsDataURL(state.lastScreenshot.blob); });
+        $('#save-ss', overlay).addEventListener('click', async ()=>{ if(state.gallery.screenshots.length >= SCREEN_LIMIT){ showWarning('⚠️ Gallery limit reached. Delete any screenshot.'); return; } const newName = overlay.querySelector('#ss-name').value || state.lastScreenshot.name; state.lastScreenshot.name = newName; await idbPut(state.lastScreenshot.id, state.lastScreenshot.blob, { id: state.lastScreenshot.id, name:newName, created: state.lastScreenshot.created }); state.gallery.screenshots.unshift({ id: state.lastScreenshot.id, name:newName, created: state.lastScreenshot.created }); setLS(META_KEY, state.gallery); showToast('✅ Saved to Gallery'); closeRecordingPopup(overlay); renderGalleryView('screens'); updateCatButtons(); });
+        $('#delete-ss', overlay).addEventListener('click', ()=>{ if(!confirm('Delete this screenshot?')) return; state.lastScreenshot = null; setStatus('Screenshot deleted'); closeRecordingPopup(overlay); updateCatButtons(); });
+    }
+
+    function openEditScreenshot(){
+        if(!state.lastScreenshot) return setStatus('No screenshot to edit');
+        const reader = new FileReader(); reader.onload = ()=> openScreenshotEditor(reader.result); reader.readAsDataURL(state.lastScreenshot.blob);
+    }
+
+    function openScreenshotEditor(dataURL){
+        const ov = createModal(); const modal = ov.querySelector('.bxd-modal');
+        modal.innerHTML = `<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px'><div style='font-weight:800'>📷 Screenshot Editor</div><div style='display:flex;gap:8px'><button id='close-edit' class='bxd-rec-btn'>❌</button></div></div><div style='display:flex;gap:12px'><canvas id='ss-canvas' style='max-width:100%'></canvas><div style='display:flex;flex-direction:column;gap:8px'><label>Color:<input id='draw-color' type='color' value='#ff0000'></label><label>Size:<input id='draw-size' type='range' min='1' max='48' value='6'></label><label>Style:<select id='draw-style'><option value='smooth'>Smooth</option><option value='pixel'>Pixel</option></select></label><button id='eraser' class='bxd-rec-btn'>Eraser</button><button id='undo' class='bxd-rec-btn'>Undo</button><button id='redo' class='bxd-rec-btn'>Redo</button><button id='save-edit' class='bxd-rec-btn'>Save Edits</button></div></div>`;
+        const canvas = modal.querySelector('#ss-canvas'); const img = new Image();
+        img.onload = ()=>{ canvas.width = img.width; canvas.height = img.height; const ctx = canvas.getContext('2d'); ctx.drawImage(img,0,0); enableDrawTools(canvas, modal); };
+        img.src = dataURL;
+        modal.querySelector('#close-edit').addEventListener('click', ()=> closeModal(ov));
+        modal.querySelector('#save-edit').addEventListener('click', ()=>{ canvas.toBlob(async blob=>{ state.lastScreenshot.blob=blob; showToast('✅ Screenshot edits saved'); closeModal(ov); }, 'image/png'); });
+    }
+
+    /* --------------------------- Draw tools (shared) --------------------------- */
+    function enableDrawTools(canvas, modal){
+        const ctx = canvas.getContext('2d');
+        let drawing = false, lastX = 0, lastY = 0;
+        const colorInput = modal.querySelector('#draw-color');
+        const sizeInput = modal.querySelector('#draw-size');
+        const styleSel = modal.querySelector('#draw-style');
+        let mode = 'draw';
+        const undoStack = [], redoStack = [];
+        function pushUndo(){ undoStack.push(canvas.toDataURL()); if(undoStack.length>60) undoStack.shift(); }
+        modal.querySelector('#eraser').addEventListener('click', ()=>{ mode = 'erase'; canvas.style.cursor='crosshair'; });
+        modal.querySelector('#undo').addEventListener('click', ()=>{ if(undoStack.length){ redoStack.push(canvas.toDataURL()); const data = undoStack.pop(); const img = new Image(); img.onload = ()=>{ ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(img,0,0); }; img.src = data; } });
+        modal.querySelector('#redo').addEventListener('click', ()=>{ if(redoStack.length){ undoStack.push(canvas.toDataURL()); const data = redoStack.pop(); const img = new Image(); img.onload = ()=>{ ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(img,0,0); }; img.src = data; } });
+        canvas.addEventListener('pointerdown', e=>{ pushUndo(); drawing=true; lastX=e.offsetX; lastY=e.offsetY; });
+        canvas.addEventListener('pointermove', e=>{ if(!drawing) return; const x = e.offsetX, y = e.offsetY; if(styleSel.value === 'smooth'){ ctx.lineJoin='round'; ctx.lineCap='round'; ctx.beginPath(); ctx.moveTo(lastX,lastY); ctx.lineTo(x,y); ctx.strokeStyle = (mode==='erase' ? '#ffffff' : colorInput.value); ctx.lineWidth = parseInt(sizeInput.value); ctx.stroke(); } else { ctx.fillStyle = (mode==='erase' ? '#ffffff' : colorInput.value); ctx.fillRect(x-(sizeInput.value/2), y-(sizeInput.value/2), sizeInput.value, sizeInput.value); } lastX = x; lastY = y; });
+        window.addEventListener('pointerup', ()=>{ drawing=false; });
+    }
+
+    /* --------------------------- Video Editor (trim + draw + save) --------------------------- */
+    function openVideoEditorWithBlob(blob, meta){
+        const ov = createModal(); const modal = ov.querySelector('.bxd-modal'); const url = URL.createObjectURL(blob);
+        modal.innerHTML = `<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px'><div style='font-weight:800'>🎥 Recording Editor - ${escapeHtml(meta.name)}</div><div><button id='close-edit' class='bxd-rec-btn'>❌</button></div></div><video id='edit-video' src='${url}' controls style='width:100%;max-height:420px;border-radius:8px'></video><div style='display:flex;gap:8px;margin-top:8px;align-items:center'><label>Start:<input id='trim-start' class='bxd-rec-input' type='text' value='0:00' style='width:80px'/></label><label>End:<input id='trim-end' class='bxd-rec-input' type='text' value='0:00' style='width:80px'/></label><button id='preview-trim' class='bxd-rec-btn'>Preview Trim</button><button id='save-trim' class='bxd-rec-btn'>Save Trim</button></div><div style='margin-top:8px;display:flex;gap:8px'><button id='draw-tool' class='bxd-rec-btn'>✏️ Draw</button><button id='text-tool' class='bxd-rec-btn'>T</button><button id='add-sound' class='bxd-rec-btn'>Add Sound</button></div><div id='video-canvas-wrap' style='display:none;margin-top:8px'><canvas id='video-canvas' style='max-width:100%'></canvas></div>`;
+        const v = modal.querySelector('#edit-video');
+        v.onloadedmetadata = ()=>{ modal.querySelector('#trim-end').value = toMMSS(v.duration); };
+        modal.querySelector('#close-edit').addEventListener('click', ()=>{ URL.revokeObjectURL(url); closeModal(ov); });
+        modal.querySelector('#preview-trim').addEventListener('click', ()=>{ const s = parseMMSS(modal.querySelector('#trim-start').value||'0:00'); const e = parseMMSS(modal.querySelector('#trim-end').value||toMMSS(v.duration)); if(e<=s) return alert('End must be > Start'); v.currentTime = s; v.play(); const stopper = ()=>{ if(v.currentTime>=e){ v.pause(); v.removeEventListener('timeupdate', stopper); } }; v.addEventListener('timeupdate', stopper); });
+        modal.querySelector('#save-trim').addEventListener('click', async ()=>{
+            if(state.gallery.videos.length >= VIDEO_LIMIT) return showWarning('⚠️ Gallery limit reached. Delete any video.');
+            const s = parseMMSS(modal.querySelector('#trim-start').value||'0:00'); const e = parseMMSS(modal.querySelector('#trim-end').value||toMMSS(v.duration));
+            if(e<=s) return alert('End must be > Start');
+            const w = v.videoWidth || 1280, h = v.videoHeight || 720;
+            const canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h; const ctx = canvas.getContext('2d');
+            const out = canvas.captureStream(30); const chunks = [];
+            let rec;
+            try{ rec = new MediaRecorder(out, { mimeType:'video/webm' }); }catch(e){ rec = new MediaRecorder(out); }
+            rec.ondataavailable = ev => { if(ev.data && ev.data.size) chunks.push(ev.data); };
+            const play = document.createElement('video'); play.muted=true; play.playsInline=true; play.src = url; document.body.appendChild(play);
+            function draw(){ if(play.paused||play.ended) return; try{ ctx.drawImage(play,0,0,canvas.width,canvas.height); }catch(e){} requestAnimationFrame(draw); }
+            rec.start();
+            play.currentTime = s; play.play();
+            draw();
+            await new Promise(res=>{ play.ontimeupdate = ()=>{ if(play.currentTime>=e){ play.pause(); rec.stop(); res(); } }; play.onerror = ()=>{ rec.stop(); res(); }; });
+            await new Promise(res=> rec.onstop = res);
+            const newBlob = new Blob(chunks, { type:'video/webm' });
+            const metaNew = { id: uid('vid'), name: `Trimmed_${meta.name}`, created: Date.now(), duration: await getBlobDuration(newBlob) };
+            await idbPut(metaNew.id, newBlob, metaNew);
+            state.gallery.videos.unshift({ id: metaNew.id, name: metaNew.name, created: metaNew.created });
+            setLS(META_KEY, state.gallery);
+            showToast('✅ Trim saved to Gallery');
+            closeModal(ov); renderGalleryView('videos');
+        });
+        modal.querySelector('#draw-tool').addEventListener('click', ()=>{
+            const wrap = modal.querySelector('#video-canvas-wrap'); wrap.style.display='block'; const canvas = modal.querySelector('#video-canvas'); canvas.width = v.videoWidth || 640; canvas.height = v.videoHeight || 360; const ctx = canvas.getContext('2d'); v.currentTime = 0; v.play(); v.addEventListener('timeupdate', ()=>{ try{ ctx.drawImage(v,0,0,canvas.width,canvas.height); }catch(e){} }); enableDrawTools(canvas, modal);
+        });
+    }
+
+    /* --------------------------- Gallery rendering & rename --------------------------- */
+    function renderGalleryCat(){
+        catArea.innerHTML = `<div class='bxd-cat-panel'><div style='display:flex;gap:8px;margin-bottom:8px'><button id='gal-videos' class='bxd-rec-btn'>Video Gallery</button><button id='gal-shots' class='bxd-rec-btn'>Screenshot Gallery</button></div><div id='gallery-view'></div></div>`;
+        $('#gal-videos', catArea).addEventListener('click', ()=> renderGalleryView('videos'));
+        $('#gal-shots', catArea).addEventListener('click', ()=> renderGalleryView('screens'));
+    }
+
+    async function renderGalleryView(mode){
+        const container = $('#gallery-view', catArea); container.innerHTML = ''; const grid = document.createElement('div'); grid.className = 'bxd-gallery-grid';
+        if(mode === 'videos'){
+            if(state.gallery.videos.length === 0) container.innerHTML = '<div>No videos saved.</div>';
+            for(const item of state.gallery.videos){
+                const wrapper = document.createElement('div'); wrapper.className='bxd-thumb';
+                const thumbImg = document.createElement('img'); thumbImg.style.width='100%'; thumbImg.style.height='90px'; thumbImg.style.objectFit='cover'; thumbImg.style.borderRadius='6px';
+                const title = document.createElement('div'); title.style.fontWeight='700'; title.style.fontSize='13px'; title.textContent = item.name;
+                const btns = document.createElement('div'); btns.style.display='flex'; btns.style.gap='6px'; btns.style.marginTop='6px';
+                const openB = document.createElement('button'); openB.className='bxd-rec-btn'; openB.textContent='Open';
+                const renameB = document.createElement('button'); renameB.className='bxd-rec-btn'; renameB.textContent='Rename';
+                const delB = document.createElement('button'); delB.className='bxd-rec-btn'; delB.textContent='Delete';
+                const dlB = document.createElement('button'); dlB.className='bxd-rec-btn'; dlB.textContent='Download';
+                btns.appendChild(openB); btns.appendChild(renameB); btns.appendChild(delB); btns.appendChild(dlB);
+                wrapper.appendChild(thumbImg); wrapper.appendChild(title); wrapper.appendChild(btns); grid.appendChild(wrapper);
+                (async ()=>{
+                    const db = await idbGet(item.id);
+                    if(db && db.blob){
+                        const v = document.createElement('video'); v.muted=true; v.preload='metadata'; v.src = URL.createObjectURL(db.blob);
+                        v.onloadeddata = ()=>{ try{ const c = document.createElement('canvas'); c.width=160; c.height=90; const ctx = c.getContext('2d'); ctx.drawImage(v,0,0,c.width,c.height); thumbImg.src = c.toDataURL('image/png'); URL.revokeObjectURL(v.src); }catch(e){} };
+                        openB.addEventListener('click', ()=> openGalleryItem('video', item.id));
+                        renameB.addEventListener('click', ()=> renameGalleryItem('video', item.id, title));
+                        delB.addEventListener('click', async ()=>{ if(!confirm('Delete this video?')) return; await idbDelete(item.id); state.gallery.videos = state.gallery.videos.filter(x=>x.id!==item.id); setLS(META_KEY, state.gallery); renderGalleryView('videos'); showToast('Deleted'); });
+                        dlB.addEventListener('click', ()=>{ const url = URL.createObjectURL(db.blob); const a=document.createElement('a'); a.href=url; a.download = item.name; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); });
+                    }
+                })();
+            }
+            container.appendChild(grid);
+        } else {
+            if(state.gallery.screenshots.length === 0) container.innerHTML = '<div>No screenshots saved.</div>';
+            for(const item of state.gallery.screenshots){
+                const wrapper = document.createElement('div'); wrapper.className='bxd-thumb';
+                const img = document.createElement('img'); img.style.width='100%'; img.style.height='120px'; img.style.objectFit='cover'; img.style.borderRadius='6px';
+                const title = document.createElement('div'); title.style.fontWeight='700'; title.style.fontSize='13px'; title.textContent = item.name;
+                const btns = document.createElement('div'); btns.style.display='flex'; btns.style.gap='6px'; btns.style.marginTop='6px';
+                const openB = document.createElement('button'); openB.className='bxd-rec-btn'; openB.textContent='Open';
+                const renameB = document.createElement('button'); renameB.className='bxd-rec-btn'; renameB.textContent='Rename';
+                const delB = document.createElement('button'); delB.className='bxd-rec-btn'; delB.textContent='Delete';
+                const dlB = document.createElement('button'); dlB.className='bxd-rec-btn'; dlB.textContent='Download';
+                btns.appendChild(openB); btns.appendChild(renameB); btns.appendChild(delB); btns.appendChild(dlB);
+                wrapper.appendChild(img); wrapper.appendChild(title); wrapper.appendChild(btns); grid.appendChild(wrapper);
+                (async ()=>{
+                    const db = await idbGet(item.id);
+                    if(db && db.blob){
+                        const url = URL.createObjectURL(db.blob); img.src = url;
+                        openB.addEventListener('click', ()=> openGalleryItem('screenshot', item.id));
+                        renameB.addEventListener('click', ()=> renameGalleryItem('screenshot', item.id, title));
+                        delB.addEventListener('click', async ()=>{ if(!confirm('Delete this screenshot?')) return; await idbDelete(item.id); state.gallery.screenshots = state.gallery.screenshots.filter(x=>x.id!==item.id); setLS(META_KEY, state.gallery); renderGalleryView('screens'); showToast('Deleted'); });
+                        dlB.addEventListener('click', ()=>{ const a=document.createElement('a'); a.href=url; a.download = item.name; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); });
+                    }
+                })();
+            }
+            container.appendChild(grid);
+        }
+    }
+
+    function renameGalleryItem(type, id, titleEl){
+        const current = titleEl.textContent;
+        const input = document.createElement('input'); input.value = current; input.style.width = '100%';
+        titleEl.replaceWith(input); input.focus();
+        input.addEventListener('blur', ()=>{ const newName = input.value || current;
+            if(type === 'video'){ const g = state.gallery.videos.find(x=>x.id===id); if(g) g.name = newName; } else { const g = state.gallery.screenshots.find(x=>x.id===id); if(g) g.name = newName; }
+            setLS(META_KEY, state.gallery); input.replaceWith(titleEl); titleEl.textContent = newName; setStatus('Renamed'); });
+    }
+
+    /* --------------------------- Open gallery item popup --------------------------- */
+    async function openGalleryItem(type, id){
+        if(type === 'video'){
+            const rec = state.gallery.videos.find(r=>r.id===id); if(!rec) return;
+            const db = await idbGet(id); if(!db) return setStatus('Blob missing');
+            const url = URL.createObjectURL(db.blob); const ov = createModal(); const modal = ov.querySelector('.bxd-modal');
+            modal.innerHTML = `<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px'><input id='g-name' value='${escapeHtml(rec.name)}' style='padding:6px' class='bxd-rec-input' /><div><button id='close-item' class='bxd-rec-btn'>❌</button></div></div><video controls style='width:100%;max-height:420px;border-radius:8px' src='${url}'></video><div style='display:flex;gap:8px;margin-top:8px'><button id='save-name' class='bxd-rec-btn'>Save Name</button><button id='delete-item' class='bxd-rec-btn'>Delete</button><button id='download-item' class='bxd-rec-btn'>Download</button></div>`;
+            modal.querySelector('#close-item').addEventListener('click', ()=>{ URL.revokeObjectURL(url); closeModal(ov); });
+            modal.querySelector('#download-item').addEventListener('click', ()=>{ const a=document.createElement('a'); a.href = url; a.download = rec.name; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); });
+            modal.querySelector('#delete-item').addEventListener('click', async ()=>{ if(!confirm('Delete this video?')) return; await idbDelete(id); state.gallery.videos = state.gallery.videos.filter(x=>x.id!==id); setLS(META_KEY, state.gallery); renderGalleryView('videos'); setStatus('Video deleted'); closeModal(ov); });
+            modal.querySelector('#save-name').addEventListener('click', ()=>{ const newName = modal.querySelector('#g-name').value || rec.name; rec.name = newName; setLS(META_KEY, state.gallery); renderGalleryView('videos'); showToast('✅ Renamed'); });
+        } else {
+            const rec = state.gallery.screenshots.find(r=>r.id===id); if(!rec) return;
+            const db = await idbGet(id); if(!db) return setStatus('Blob missing');
+            const url = URL.createObjectURL(db.blob); const ov = createModal(); const modal = ov.querySelector('.bxd-modal');
+            modal.innerHTML = `<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px'><input id='g-name' value='${escapeHtml(rec.name)}' style='padding:6px' class='bxd-rec-input' /><div><button id='close-item' class='bxd-rec-btn'>❌</button></div></div><img src='${url}' style='width:100%;max-height:420px;border-radius:8px;object-fit:contain'><div style='display:flex;gap:8px;margin-top:8px'><button id='save-name' class='bxd-rec-btn'>Save Name</button><button id='delete-item' class='bxd-rec-btn'>Delete</button><button id='download-item' class='bxd-rec-btn'>Download</button></div>`;
+            modal.querySelector('#close-item').addEventListener('click', ()=>{ URL.revokeObjectURL(url); closeModal(ov); });
+            modal.querySelector('#download-item').addEventListener('click', ()=>{ const a=document.createElement('a'); a.href = url; a.download = rec.name; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); });
+            modal.querySelector('#delete-item').addEventListener('click', async ()=>{ if(!confirm('Delete this screenshot?')) return; await idbDelete(id); state.gallery.screenshots = state.gallery.screenshots.filter(x=>x.id!==id); setLS(META_KEY, state.gallery); renderGalleryView('screens'); setStatus('Screenshot deleted'); closeModal(ov); });
+            modal.querySelector('#save-name').addEventListener('click', ()=>{ const newName = modal.querySelector('#g-name').value || rec.name; rec.name = newName; setLS(META_KEY, state.gallery); renderGalleryView('screens'); showToast('✅ Renamed'); });
+        }
+    }
+
+    /* --------------------------- Utilities: modals, toasts, status, durations --------------------------- */
+    function createModal(){ const ov = document.createElement('div'); ov.className='bxd-modal-overlay'; const modal = document.createElement('div'); modal.className='bxd-modal'; modal.style.background='var(--panel-trans)'; ov.appendChild(modal); document.body.appendChild(ov); setTimeout(()=> ov.classList.add('bxd-show'), 20); return ov; }
+    function closeModal(ov){ ov.classList.remove('bxd-show'); setTimeout(()=> ov.remove(), 260); }
+    function showWarning(msg){ const ov = createModal(); const m = ov.querySelector('.bxd-modal'); m.innerHTML = `<div style='font-weight:800;margin-bottom:8px'>Warning</div><div style='margin-bottom:12px'>${escapeHtml(msg)}</div><div style='display:flex;justify-content:flex-end'><button id='warn-close' class='bxd-rec-btn'>Close</button></div>`; m.querySelector('#warn-close').addEventListener('click', ()=> closeModal(ov)); }
+    function setStatus(t){ $('#status', panel).textContent = t; }
+    function showToast(msg, timeout = 2500){ const t = document.createElement('div'); t.className='bxd-toast'; t.style.background='var(--panel-trans)'; t.style.color='var(--panel-text)'; t.textContent = msg; document.body.appendChild(t); t.style.opacity = '0'; t.style.transform = 'translateY(12px)'; setTimeout(()=>{ t.style.transition='all 260ms ease'; t.style.opacity='1'; t.style.transform='translateY(0)'; }, 20); setTimeout(()=>{ t.style.opacity='0'; t.style.transform='translateY(12px)'; setTimeout(()=> t.remove(), 260); }, timeout); }
+    function toMMSS(sec){ sec = Math.round(sec||0); const m = Math.floor(sec/60); const s = sec % 60; return `${m}:${s.toString().padStart(2,'0')}`; }
+    function parseMMSS(s){ const parts = (s||'0:00').split(':').map(x=>parseFloat(x)||0); return (parts[0]*60) + (parts[1]||0); }
+    async function getBlobDuration(blob){ return new Promise(res=>{ const v = document.createElement('video'); v.preload='metadata'; v.muted=true; v.src = URL.createObjectURL(blob); v.onloadedmetadata = ()=>{ const d = v.duration; URL.revokeObjectURL(v.src); res(isNaN(d)?0:Math.round(d)); }; v.onerror = ()=>{ URL.revokeObjectURL(v.src); res(0); }; }); }
+
+    /* --------------------------- Status / Buttons update --------------------------- */
+    function updateCatButtons(){
+        const editBtn = $('#btn-editvideo', panel);
+        const finishBtn = $('#btn-finishvideo', panel);
+        if(editBtn) editBtn.disabled = (state.sessionSegments.length === 0);
+        if(finishBtn) finishBtn.disabled = (state.sessionSegments.length === 0 || (state.gallery.videos.length + state.sessionSegments.length > VIDEO_LIMIT));
+        const finishSnap = $('#btn-finishsnap', panel);
+        if(finishSnap) finishSnap.disabled = (state.gallery.screenshots.length >= SCREEN_LIMIT);
+        const stopB = $('#btn-stop', panel);
+        if(stopB) stopB.disabled = !state.recording;
+    }
+
+    /* --------------------------- Trim / Save session / Save to gallery --------------------------- */
+    async function saveSessionToGallery(){
+        if(state.sessionSegments.length === 0) return setStatus('No session recordings to save');
+        if(state.gallery.videos.length + state.sessionSegments.length > VIDEO_LIMIT) return showWarning('⚠️ Gallery limit reached. Delete any video.');
+        for(const s of state.sessionSegments){ await idbPut(s.id, s.blob, s.meta); state.gallery.videos.unshift({ id: s.id, name: s.meta.name, created: s.meta.created }); }
+        state.sessionSegments = [];
+        setLS(META_KEY, state.gallery);
+        renderGalleryView('videos');
+        setStatus('Saved session recordings to Gallery');
+        updateCatButtons();
+    }
+
+    async function finishSessionToEdited(){
+        if(state.sessionSegments.length === 0) return setStatus('No session segments');
+        if(state.gallery.videos.length + 1 > VIDEO_LIMIT) return showWarning('⚠️ Gallery limit reached. Delete any video.');
+        // concatenate by drawing frames - approximate method used previously
+        const probe = state.sessionSegments[0].blob;
+        const probeURL = URL.createObjectURL(probe);
+        const pvid = document.createElement('video'); pvid.muted=true; pvid.src = probeURL;
+        await pvid.play().catch(()=>{}); const w = pvid.videoWidth || 1280; const h = pvid.videoHeight || 720; pvid.pause(); URL.revokeObjectURL(probeURL);
+        const canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h; const ctx = canvas.getContext('2d');
+        const outStream = canvas.captureStream(30); const chunks = []; let mediaR;
+        try{ mediaR = new MediaRecorder(outStream, { mimeType: 'video/webm' }); }catch(e){ mediaR = new MediaRecorder(outStream); }
+        mediaR.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
+        const player = document.createElement('video'); player.muted=true; player.playsInline=true; player.style.display='none'; document.body.appendChild(player);
+        function draw(){ if(player.paused||player.ended) return; try{ ctx.drawImage(player,0,0,canvas.width,canvas.height); }catch(e){} requestAnimationFrame(draw); }
+        mediaR.start();
+        for(const s of state.sessionSegments){
+            const url = URL.createObjectURL(s.blob); player.src = url; await player.play().catch(()=>{}); draw();
+            await new Promise(res=>{ player.onended = ()=>{ URL.revokeObjectURL(url); res(); }; player.onerror = ()=>{ URL.revokeObjectURL(url); res(); }; });
+        }
+        await new Promise(r=> setTimeout(r, 250));
+        mediaR.stop(); await new Promise(res=> mediaR.onstop = res);
+        const outBlob = new Blob(chunks, { type:'video/webm' });
+        const meta = { id: uid('vid'), name: `Edited_${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, created: Date.now(), duration: await getBlobDuration(outBlob) };
+        await idbPut(meta.id, outBlob, meta); state.gallery.videos.unshift({ id: meta.id, name: meta.name, created: meta.created });
+        setLS(META_KEY, state.gallery); state.sessionSegments = []; renderGalleryView('videos'); setStatus('Edited video saved to Gallery'); updateCatButtons();
+        player.remove();
+    }
+
+    /* --------------------------- Webcam overlay --------------------------- */
+    let webcamEl = null;
+    async function toggleWebcam(){
+        if(webcamEl){ webcamEl.remove(); webcamEl = null; if(state.webcamStream){ state.webcamStream.getTracks().forEach(t=>t.stop()); state.webcamStream=null; } updateStatusIndicators(); return; }
+        try{
+            const s = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
+            state.webcamStream = s;
+            webcamEl = document.createElement('div'); webcamEl.className='bxd-webcam'; webcamEl.style.background='var(--panel-trans)'; webcamEl.style.color='var(--panel-text)';
+            const vid = document.createElement('video'); vid.autoplay=true; vid.playsInline=true; vid.muted=true; vid.srcObject = s; vid.style.width='100%'; vid.style.height='100%';
+            const closeBtn = document.createElement('button'); closeBtn.textContent='✖'; closeBtn.className='bxd-rec-btn'; closeBtn.style.position='absolute'; closeBtn.style.right='6px'; closeBtn.style.top='6px'; closeBtn.style.padding='4px';
+            closeBtn.addEventListener('click', ()=>{ webcamEl.remove(); webcamEl=null; s.getTracks().forEach(t=>t.stop()); state.webcamStream=null; updateStatusIndicators(); });
+            webcamEl.appendChild(vid); webcamEl.appendChild(closeBtn); document.body.appendChild(webcamEl); makeElementDraggable(webcamEl);
+            updateStatusIndicators();
+        }catch(e){ setStatus('Webcam denied'); }
+    }
+
+    function makeElementDraggable(el){
+        let dragging=false, sx=0, sy=0, ox=0, oy=0;
+        el.addEventListener('pointerdown', e=>{ dragging=true; sx=e.clientX; sy=e.clientY; const rect = el.getBoundingClientRect(); ox = rect.left; oy = rect.top; el.setPointerCapture && el.setPointerCapture(e.pointerId); });
+        window.addEventListener('pointermove', e=>{ if(!dragging) return; const dx = e.clientX - sx, dy = e.clientY - sy; el.style.left = (ox + dx) + 'px'; el.style.top = (oy + dy) + 'px'; el.style.right='auto'; el.style.bottom='auto'; });
+        window.addEventListener('pointerup', ()=>{ if(dragging){ dragging=false; setLS(POS_KEY, { left: panel.style.left, top: panel.style.top }); } });
+    }
+
+    /* --------------------------- Misc helpers already used earlier --------------------------- */
+    function updateStatusIndicators(){ const strec = $('#st-rec', catArea); if(strec) strec.textContent = state.recording ? '🟢' : '🔴'; const stshot = $('#st-shot', catArea); if(stshot) stshot.textContent = state.lastScreenshot ? '🟢' : '🔴'; const stmic = $('#st-mic', catArea); if(stmic) stmic.textContent = (state.recorder ? '🟢' : '🔴'); const stweb = $('#st-webcam', catArea); if(stweb) stweb.textContent = state.webcamStream ? '🟢' : '🔴'; }
+
+    /* --------------------------- Helpers used earlier but defined late: createModal/closeModal used above for editors */
+
+// end of script
+})();
